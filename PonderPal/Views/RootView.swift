@@ -160,16 +160,23 @@ struct LoginView: View {
 
                 // 认证按钮
                 Button(action: performAuth) {
-                    Text(authMode.title(language: state.language))
-                        .font(.headline)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
+                    Group {
+                        if state.authBusy {
+                            ProgressView()
+                        } else {
+                            Text(authMode.title(language: state.language))
+                                .font(.headline)
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(authMode == .login ? .indigo : .green)
                 .padding(.horizontal, 32)
                 .disabled(usernameInput.trimmingCharacters(in: .whitespaces).isEmpty || 
-                         passwordInput.trimmingCharacters(in: .whitespaces).isEmpty)
+                         passwordInput.trimmingCharacters(in: .whitespaces).isEmpty ||
+                         state.authBusy)
 
                 Spacer()
 
@@ -192,36 +199,31 @@ struct LoginView: View {
 
     private func performAuth() {
         clearError()
-        
-        let result: Result<Void, AppState.AuthError>
-        
-        switch authMode {
-        case .login:
-            result = state.login(username: usernameInput, password: passwordInput)
-        case .register:
-            result = state.register(username: usernameInput, password: passwordInput)
-        }
-        
-        switch result {
-        case .success():
-            // 认证成功，清空输入框
-            clearInputs()
-            
-            // 同步到服务器
-            state.syncToServer()
-            Task {
+
+        Task {
+            let result: Result<Void, AppState.AuthError>
+
+            switch authMode {
+            case .login:
+                result = await state.login(username: usernameInput, password: passwordInput)
+            case .register:
+                result = await state.register(username: usernameInput, password: passwordInput)
+            }
+
+            switch result {
+            case .success():
+                clearInputs()
+                state.syncToServer()
                 await state.pullFriendsFromServer()
-            }
-            
-        case .failure(let error):
-            // 显示错误
-            withAnimation {
-                authError = error.localizedDescription(language: state.language)
-            }
-            
-            // 3秒后隐藏错误
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                clearError()
+
+            case .failure(let error):
+                withAnimation {
+                    authError = error.localizedDescription(language: state.language)
+                }
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                    clearError()
+                }
             }
         }
     }

@@ -31,9 +31,8 @@ class AppState: ObservableObject {
     @Published var friends:  [FriendEntry] = []
     @Published var language: String        = "zh"
     @Published var isLoggedIn: Bool        = false
-
-    // ── Local user management ─────────────────────────────────────────
-    private var localUsers: [String: String] = [:]  // username: password
+    @Published var authToken: String?      = nil
+    @Published var authBusy: Bool          = false
 
     // ── Transient UI state ─────────────────────────────────────────────
     @Published var selectedTab: Tab        = .today
@@ -58,21 +57,13 @@ class AppState: ObservableObject {
     func load() {
         username = defaults.string(forKey: "dr_username") ?? ""
         language = defaults.string(forKey: "dr_lang") ?? "zh"
-        isLoggedIn = defaults.bool(forKey: "dr_isLoggedIn")
-        
-        // Load local users
-        if let userData = defaults.data(forKey: "dr_local_users"),
-           let users = try? JSONDecoder().decode([String: String].self, from: userData) {
-            localUsers = users
-        }
+        authToken = KeychainService.loadToken()
+        isLoggedIn = authToken != nil && !username.trimmingCharacters(in: .whitespaces).isEmpty
 
-        if let data = defaults.data(forKey: "dr_answers"),
-           let decoded = try? JSONDecoder().decode([String: AnswerEntry].self, from: data) {
-            answers = decoded
-        }
-        if let data = defaults.data(forKey: "dr_friends"),
-           let decoded = try? JSONDecoder().decode([FriendEntry].self, from: data) {
-            friends = decoded
+        if isLoggedIn {
+            loadUserData(for: username)
+        } else {
+            clearUserData()
         }
     }
 
@@ -80,14 +71,58 @@ class AppState: ObservableObject {
         defaults.set(username, forKey: "dr_username")
         defaults.set(language, forKey: "dr_lang")
         defaults.set(isLoggedIn, forKey: "dr_isLoggedIn")
-        
-        // Save local users
-        if let userData = try? JSONEncoder().encode(localUsers) {
-            defaults.set(userData, forKey: "dr_local_users")
+
+        let trimmedUsername = username.trimmingCharacters(in: .whitespaces)
+        if !trimmedUsername.isEmpty {
+            saveUserData(for: trimmedUsername)
         }
-        
-        if let data = try? JSONEncoder().encode(answers) { defaults.set(data, forKey: "dr_answers") }
-        if let data = try? JSONEncoder().encode(friends) { defaults.set(data, forKey: "dr_friends") }
+    }
+
+    private func answersKey(for username: String) -> String {
+        "dr_answers_\(username)"
+    }
+
+    private func friendsKey(for username: String) -> String {
+        "dr_friends_\(username)"
+    }
+
+    private func loadUserData(for username: String) {
+        let trimmedUsername = username.trimmingCharacters(in: .whitespaces)
+        guard !trimmedUsername.isEmpty else {
+            clearUserData()
+            return
+        }
+
+        if let data = defaults.data(forKey: answersKey(for: trimmedUsername)),
+           let decoded = try? JSONDecoder().decode([String: AnswerEntry].self, from: data) {
+            answers = decoded
+        } else {
+            answers = [:]
+        }
+
+        if let data = defaults.data(forKey: friendsKey(for: trimmedUsername)),
+           let decoded = try? JSONDecoder().decode([FriendEntry].self, from: data) {
+            friends = decoded
+        } else {
+            friends = []
+        }
+    }
+
+    private func saveUserData(for username: String) {
+        let trimmedUsername = username.trimmingCharacters(in: .whitespaces)
+        guard !trimmedUsername.isEmpty else { return }
+
+        if let data = try? JSONEncoder().encode(answers) {
+            defaults.set(data, forKey: answersKey(for: trimmedUsername))
+        }
+        if let data = try? JSONEncoder().encode(friends) {
+            defaults.set(data, forKey: friendsKey(for: trimmedUsername))
+        }
+    }
+
+    private func clearUserData() {
+        answers = [:]
+        friends = []
     }
 
     // MARK: - Today helpers
@@ -110,7 +145,7 @@ class AppState: ObservableObject {
     }
 
     var isUserLoggedIn: Bool {
-        !username.trimmingCharacters(in: .whitespaces).isEmpty && isLoggedIn
+        !username.trimmingCharacters(in: .whitespaces).isEmpty && isLoggedIn && authToken != nil
     }
 
     // MARK: - Login/Register Methods
@@ -120,6 +155,7 @@ class AppState: ObservableObject {
         case userAlreadyExists
         case userNotFound
         case incorrectPassword
+        case network(String)
         
         func localizedDescription(language: String) -> String {
             switch self {
@@ -131,11 +167,14 @@ class AppState: ObservableObject {
                 return language == "zh" ? "用户不存在" : "User not found"
             case .incorrectPassword:
                 return language == "zh" ? "密码错误" : "Incorrect password"
+            case .network(let message):
+                return message
             }
         }
     }
     
-    func register(username: String, password: String) -> Result<Void, AuthError> {
+    @MainActor
+    func register(username: String, password: String) async -> Result<Void, AuthError> {
         let trimmedUsername = username.trimmingCharacters(in: .whitespaces)
         let trimmedPassword = password.trimmingCharacters(in: .whitespaces)
         
@@ -143,22 +182,19 @@ class AppState: ObservableObject {
             return .failure(.emptyFields)
         }
         
-        guard localUsers[trimmedUsername] == nil else {
-            return .failure(.userAlreadyExists)
+        authBusy = true
+        defer { authBusy = false }
+
+        do {
+            try await APIService.register(username: trimmedUsername, password: trimmedPassword)
+            return await login(username: trimmedUsername, password: trimmedPassword)
+        } catch {
+            return .failure(mapAuthError(error))
         }
-        
-        // Save new user
-        localUsers[trimmedUsername] = trimmedPassword
-        
-        // Auto login after registration
-        self.username = trimmedUsername
-        self.isLoggedIn = true
-        save()
-        
-        return .success(())
     }
     
-    func login(username: String, password: String) -> Result<Void, AuthError> {
+    @MainActor
+    func login(username: String, password: String) async -> Result<Void, AuthError> {
         let trimmedUsername = username.trimmingCharacters(in: .whitespaces)
         let trimmedPassword = password.trimmingCharacters(in: .whitespaces)
         
@@ -166,31 +202,53 @@ class AppState: ObservableObject {
             return .failure(.emptyFields)
         }
         
-        guard let storedPassword = localUsers[trimmedUsername] else {
-            return .failure(.userNotFound)
+        authBusy = true
+        defer { authBusy = false }
+
+        do {
+            let response = try await APIService.login(username: trimmedUsername, password: trimmedPassword)
+            authToken = response.token
+            KeychainService.saveToken(response.token)
+            self.username = response.user.username
+            self.isLoggedIn = true
+            loadUserData(for: response.user.username)
+            save()
+            return .success(())
+        } catch {
+            return .failure(mapAuthError(error))
         }
-        
-        guard storedPassword == trimmedPassword else {
-            return .failure(.incorrectPassword)
-        }
-        
-        // Login successful
-        self.username = trimmedUsername
-        self.isLoggedIn = true
-        save()
-        
-        return .success(())
     }
     
     func logout() {
+        let currentUsername = username.trimmingCharacters(in: .whitespaces)
+        if !currentUsername.isEmpty {
+            saveUserData(for: currentUsername)
+        }
+
         username = ""
         isLoggedIn = false
+        authToken = nil
+        clearUserData()
+        KeychainService.deleteToken()
         
-        // Clear current user but keep registered users
         defaults.removeObject(forKey: "dr_username")
         defaults.removeObject(forKey: "dr_isLoggedIn")
         
         save()
+    }
+
+    private func mapAuthError(_ error: Error) -> AuthError {
+        let message = error.localizedDescription
+        if message.localizedCaseInsensitiveContains("already exists") {
+            return .userAlreadyExists
+        }
+        if message.localizedCaseInsensitiveContains("invalid username or password") {
+            return .incorrectPassword
+        }
+        if message.localizedCaseInsensitiveContains("not found") {
+            return .userNotFound
+        }
+        return .network(message)
     }
 
     // MARK: - Share code (v3 — username only, UTF-8 base64)
@@ -227,24 +285,24 @@ class AppState: ObservableObject {
     // MARK: - Server sync
 
     func syncToServer() {
-        guard isUserLoggedIn else { return }
+        guard isUserLoggedIn, let token = authToken else { return }
         syncTask?.cancel()
         syncTask = Task {
-            await APIService.syncAnswers(username: username, answers: answers)
+            await APIService.syncAnswers(username: username, answers: answers, token: token)
         }
     }
 
     @MainActor
     func pullFriendsFromServer() async {
-        guard isUserLoggedIn else { return }
+        guard isUserLoggedIn, let token = authToken else { return }
         syncBusy = true
         defer { syncBusy = false }
 
-        let serverFriends = await APIService.getFriends(username: username)
+        let serverFriends = await APIService.getFriends(username: username, token: token)
         var changed = false
 
         for fname in serverFriends {
-            guard let fetched = await APIService.getFriendAnswers(name: fname) else { continue }
+            guard let fetched = await APIService.getFriendAnswers(name: fname, token: token) else { continue }
             let snapshot = FriendSnapshot(answers: fetched, syncedAt: Date().timeIntervalSince1970)
             if let idx = friends.firstIndex(where: { $0.name == fname }) {
                 friends[idx].snapshot = snapshot
@@ -258,12 +316,12 @@ class AppState: ObservableObject {
 
     @MainActor
     func importFriend(code: String) async -> Result<String, ImportError> {
-        guard isUserLoggedIn else { return .failure(.notLoggedIn) }
+        guard isUserLoggedIn, let token = authToken else { return .failure(.notLoggedIn) }
         guard let friendName = parseFriendCode(code) else { return .failure(.invalidCode) }
         guard friendName != username else { return .failure(.selfImport) }
 
         // Link bidirectionally on server
-        let serverAnswers = await APIService.linkFriend(me: username, friend: friendName)
+        let serverAnswers = await APIService.linkFriend(me: username, friend: friendName, token: token)
         let snapshot = FriendSnapshot(
             answers: serverAnswers ?? [:],
             syncedAt: Date().timeIntervalSince1970
