@@ -30,12 +30,16 @@ class AppState: ObservableObject {
     @Published var answers:  [String: AnswerEntry] = [:]   // key = "qId_year"
     @Published var friends:  [FriendEntry] = []
     @Published var language: String        = "zh"
+    @Published var isLoggedIn: Bool        = false
+
+    // ── Local user management ─────────────────────────────────────────
+    private var localUsers: [String: String] = [:]  // username: password
 
     // ── Transient UI state ─────────────────────────────────────────────
     @Published var selectedTab: Tab        = .today
     @Published var syncBusy:    Bool       = false
 
-    enum Tab { case today, history, friends }
+    enum Tab { case today, history, friends, settings }
 
     private let defaults = UserDefaults.standard
     private var syncTask: Task<Void, Never>?
@@ -54,6 +58,13 @@ class AppState: ObservableObject {
     func load() {
         username = defaults.string(forKey: "dr_username") ?? ""
         language = defaults.string(forKey: "dr_lang") ?? "zh"
+        isLoggedIn = defaults.bool(forKey: "dr_isLoggedIn")
+        
+        // Load local users
+        if let userData = defaults.data(forKey: "dr_local_users"),
+           let users = try? JSONDecoder().decode([String: String].self, from: userData) {
+            localUsers = users
+        }
 
         if let data = defaults.data(forKey: "dr_answers"),
            let decoded = try? JSONDecoder().decode([String: AnswerEntry].self, from: data) {
@@ -68,6 +79,13 @@ class AppState: ObservableObject {
     func save() {
         defaults.set(username, forKey: "dr_username")
         defaults.set(language, forKey: "dr_lang")
+        defaults.set(isLoggedIn, forKey: "dr_isLoggedIn")
+        
+        // Save local users
+        if let userData = try? JSONEncoder().encode(localUsers) {
+            defaults.set(userData, forKey: "dr_local_users")
+        }
+        
         if let data = try? JSONEncoder().encode(answers) { defaults.set(data, forKey: "dr_answers") }
         if let data = try? JSONEncoder().encode(friends) { defaults.set(data, forKey: "dr_friends") }
     }
@@ -91,8 +109,88 @@ class AppState: ObservableObject {
         return answers[answerKey(qId, year)] != nil
     }
 
-    var isLoggedIn: Bool {
-        !username.trimmingCharacters(in: .whitespaces).isEmpty
+    var isUserLoggedIn: Bool {
+        !username.trimmingCharacters(in: .whitespaces).isEmpty && isLoggedIn
+    }
+
+    // MARK: - Login/Register Methods
+    
+    enum AuthError: Error {
+        case emptyFields
+        case userAlreadyExists
+        case userNotFound
+        case incorrectPassword
+        
+        func localizedDescription(language: String) -> String {
+            switch self {
+            case .emptyFields:
+                return language == "zh" ? "用户名和密码不能为空" : "Username and password cannot be empty"
+            case .userAlreadyExists:
+                return language == "zh" ? "用户名已存在" : "User already exists"
+            case .userNotFound:
+                return language == "zh" ? "用户不存在" : "User not found"
+            case .incorrectPassword:
+                return language == "zh" ? "密码错误" : "Incorrect password"
+            }
+        }
+    }
+    
+    func register(username: String, password: String) -> Result<Void, AuthError> {
+        let trimmedUsername = username.trimmingCharacters(in: .whitespaces)
+        let trimmedPassword = password.trimmingCharacters(in: .whitespaces)
+        
+        guard !trimmedUsername.isEmpty && !trimmedPassword.isEmpty else {
+            return .failure(.emptyFields)
+        }
+        
+        guard localUsers[trimmedUsername] == nil else {
+            return .failure(.userAlreadyExists)
+        }
+        
+        // Save new user
+        localUsers[trimmedUsername] = trimmedPassword
+        
+        // Auto login after registration
+        self.username = trimmedUsername
+        self.isLoggedIn = true
+        save()
+        
+        return .success(())
+    }
+    
+    func login(username: String, password: String) -> Result<Void, AuthError> {
+        let trimmedUsername = username.trimmingCharacters(in: .whitespaces)
+        let trimmedPassword = password.trimmingCharacters(in: .whitespaces)
+        
+        guard !trimmedUsername.isEmpty && !trimmedPassword.isEmpty else {
+            return .failure(.emptyFields)
+        }
+        
+        guard let storedPassword = localUsers[trimmedUsername] else {
+            return .failure(.userNotFound)
+        }
+        
+        guard storedPassword == trimmedPassword else {
+            return .failure(.incorrectPassword)
+        }
+        
+        // Login successful
+        self.username = trimmedUsername
+        self.isLoggedIn = true
+        save()
+        
+        return .success(())
+    }
+    
+    func logout() {
+        username = ""
+        isLoggedIn = false
+        
+        // Clear current user but keep registered users
+        defaults.removeObject(forKey: "dr_username")
+        defaults.removeObject(forKey: "dr_isLoggedIn")
+        
+        save()
     }
 
     // MARK: - Share code (v3 — username only, UTF-8 base64)
@@ -129,7 +227,7 @@ class AppState: ObservableObject {
     // MARK: - Server sync
 
     func syncToServer() {
-        guard !username.isEmpty else { return }
+        guard isUserLoggedIn else { return }
         syncTask?.cancel()
         syncTask = Task {
             await APIService.syncAnswers(username: username, answers: answers)
@@ -138,7 +236,7 @@ class AppState: ObservableObject {
 
     @MainActor
     func pullFriendsFromServer() async {
-        guard !username.isEmpty else { return }
+        guard isUserLoggedIn else { return }
         syncBusy = true
         defer { syncBusy = false }
 
@@ -160,7 +258,7 @@ class AppState: ObservableObject {
 
     @MainActor
     func importFriend(code: String) async -> Result<String, ImportError> {
-        guard !username.isEmpty else { return .failure(.notLoggedIn) }
+        guard isUserLoggedIn else { return .failure(.notLoggedIn) }
         guard let friendName = parseFriendCode(code) else { return .failure(.invalidCode) }
         guard friendName != username else { return .failure(.selfImport) }
 

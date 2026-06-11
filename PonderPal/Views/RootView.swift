@@ -5,7 +5,7 @@ struct RootView: View {
     @EnvironmentObject var state: AppState
 
     var body: some View {
-        if state.isLoggedIn {
+        if state.isUserLoggedIn {
             MainTabView()
                 .task {
                     // On launch: push local answers then pull friend updates
@@ -40,7 +40,7 @@ struct MainTabView: View {
         }
         .background(Color(red: 0.95, green: 0.95, blue: 0.97)) // 与截图一致的浅灰色背景
         .onChange(of: state.selectedTab) { tab in
-            if tab == .friends || tab == .history {
+            if tab == .friends || tab == .history || tab == .settings {
                 Task { await state.pullFriendsFromServer() }
             }
         }
@@ -51,8 +51,26 @@ struct MainTabView: View {
 
 struct LoginView: View {
     @EnvironmentObject var state: AppState
-    @State private var input = ""
-    @FocusState private var focused: Bool
+    @State private var usernameInput = ""
+    @State private var passwordInput = ""
+    @State private var authMode: AuthMode = .login
+    @State private var authError: String? = nil
+    @FocusState private var usernameFocused: Bool
+    @FocusState private var passwordFocused: Bool
+    
+    enum AuthMode: String, CaseIterable {
+        case login = "Login"
+        case register = "Register"
+        
+        func title(language: String) -> String {
+            switch self {
+            case .login:
+                return language == "zh" ? "登录" : "Login"
+            case .register:
+                return language == "zh" ? "注册" : "Register"
+            }
+        }
+    }
 
     var body: some View {
         NavigationStack {
@@ -60,44 +78,98 @@ struct LoginView: View {
                 Spacer()
 
                 // App icon + name
-                VStack(spacing: 12) {
-                    Image(systemName: "moon.stars.fill")
-                        .font(.system(size: 56))
-                        .foregroundStyle(.indigo)
-                    Text("念伴")
-                        .font(.system(size: 34, weight: .semibold, design: .serif))
-                    Text("Ponder Pal")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+               VStack(spacing: 12) {
+                   Image(systemName: "moon.stars.fill")
+                       .font(.system(size: 56))
+                       .foregroundStyle(.indigo)
+
+                   Text(state.language == "zh" ? "念伴" : "PonderPal")
+                       .font(.system(size: 34, weight: .semibold, design: .serif))
+
+                   Text(
+                       state.language == "zh"
+                       ? "记录思绪，陪伴成长"
+                       : "Your Reflection Companion"
+                   )
+                   .font(.subheadline)
+                   .foregroundStyle(.secondary)
+               }
+
+                // 登录/注册切换
+                Picker("Auth Mode", selection: $authMode) {
+                    ForEach(AuthMode.allCases, id: \.self) { mode in
+                        Text(mode.title(language: state.language))
+                            .tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 32)
+                .onChange(of: authMode) { _ in
+                    clearError()
                 }
 
-                // Username input
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(state.language == "zh" ? "你的名字" : "Your name")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                    TextField(
-                        state.language == "zh" ? "输入昵称…" : "Enter a nickname…",
-                        text: $input
-                    )
-                    .focused($focused)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.body)
-                    .autocorrectionDisabled()
-                    .onSubmit { login() }
+                // 认证表单
+                VStack(alignment: .leading, spacing: 20) {
+                    // 用户名输入
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(state.language == "zh" ? "用户名" : "Username")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        
+                        TextField(
+                            state.language == "zh" ? "输入用户名" : "Enter username",
+                            text: $usernameInput
+                        )
+                        .focused($usernameFocused)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .onSubmit {
+                            passwordFocused = true
+                        }
+                    }
+                    
+                    // 密码输入
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(state.language == "zh" ? "密码" : "Password")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        
+                        SecureField(
+                            state.language == "zh" ? "输入密码" : "Enter password",
+                            text: $passwordInput
+                        )
+                        .focused($passwordFocused)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body)
+                        .onSubmit {
+                            performAuth()
+                        }
+                    }
+                    
+                    // 错误提示
+                    if let error = authError {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .transition(.opacity)
+                    }
                 }
                 .padding(.horizontal, 32)
 
-                Button(action: login) {
-                    Text(state.language == "zh" ? "开始" : "Get Started")
+                // 认证按钮
+                Button(action: performAuth) {
+                    Text(authMode.title(language: state.language))
                         .font(.headline)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 14)
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(.indigo)
+                .tint(authMode == .login ? .indigo : .green)
                 .padding(.horizontal, 32)
-                .disabled(input.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(usernameInput.trimmingCharacters(in: .whitespaces).isEmpty || 
+                         passwordInput.trimmingCharacters(in: .whitespaces).isEmpty)
 
                 Spacer()
 
@@ -112,18 +184,58 @@ struct LoginView: View {
                 }
                 .padding(.bottom, 20)
             }
-            .onAppear { focused = true }
+            .onAppear { 
+                usernameFocused = true 
+            }
         }
     }
 
-    private func login() {
-        let name = input.trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty else { return }
-        state.username = name
-        state.save()
-        Task {
+    private func performAuth() {
+        clearError()
+        
+        let result: Result<Void, AppState.AuthError>
+        
+        switch authMode {
+        case .login:
+            result = state.login(username: usernameInput, password: passwordInput)
+        case .register:
+            result = state.register(username: usernameInput, password: passwordInput)
+        }
+        
+        switch result {
+        case .success():
+            // 认证成功，清空输入框
+            clearInputs()
+            
+            // 同步到服务器
             state.syncToServer()
-            await state.pullFriendsFromServer()
+            Task {
+                await state.pullFriendsFromServer()
+            }
+            
+        case .failure(let error):
+            // 显示错误
+            withAnimation {
+                authError = error.localizedDescription(language: state.language)
+            }
+            
+            // 3秒后隐藏错误
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                clearError()
+            }
+        }
+    }
+    
+    private func clearInputs() {
+        usernameInput = ""
+        passwordInput = ""
+        usernameFocused = false
+        passwordFocused = false
+    }
+    
+    private func clearError() {
+        withAnimation {
+            authError = nil
         }
     }
 }
@@ -132,8 +244,6 @@ struct LoginView: View {
 
 struct TopNavigationBar: View {
     @EnvironmentObject var state: AppState
-    @State private var showingRename = false
-    @State private var newName = ""
     
     var body: some View {
         HStack {
@@ -143,16 +253,9 @@ struct TopNavigationBar: View {
             
             Spacer()
             
-            Text(state.username)
+            Text(state.isUserLoggedIn ? state.username : (state.language == "zh" ? "游客" : "Guest"))
                 .font(.body)
                 .foregroundStyle(.secondary)
-            
-            Button(state.language == "zh" ? "重命名" : "Rename") {
-                newName = state.username
-                showingRename = true
-            }
-            .font(.body)
-            .foregroundStyle(.secondary)
             
             Button {
                 state.language = state.language == "zh" ? "en" : "zh"
@@ -169,16 +272,6 @@ struct TopNavigationBar: View {
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
         .background(Color(.systemBackground))
-        .alert(state.language == "zh" ? "重命名" : "Rename", isPresented: $showingRename) {
-            TextField(state.language == "zh" ? "新名字" : "New name", text: $newName)
-            Button(state.language == "zh" ? "取消" : "Cancel", role: .cancel) { }
-            Button(state.language == "zh" ? "保存" : "Save") {
-                if !newName.trimmingCharacters(in: .whitespaces).isEmpty {
-                    state.username = newName.trimmingCharacters(in: .whitespaces)
-                    state.save()
-                }
-            }
-        }
     }
 }
 
@@ -191,7 +284,7 @@ struct CustomTabView: View {
         VStack(spacing: 0) {
             // Tab buttons
             HStack(spacing: 0) {
-                ForEach([AppState.Tab.today, .history, .friends], id: \.self) { tab in
+                ForEach([AppState.Tab.today, .history, .friends, .settings], id: \.self) { tab in
                     Button {
                         state.selectedTab = tab
                     } label: {
@@ -211,7 +304,7 @@ struct CustomTabView: View {
             
             // Underline for selected tab
             HStack(spacing: 0) {
-                ForEach([AppState.Tab.today, .history, .friends], id: \.self) { tab in
+                ForEach([AppState.Tab.today, .history, .friends, .settings], id: \.self) { tab in
                     Rectangle()
                         .fill(state.selectedTab == tab ? Color(red: 0.4, green: 0.6, blue: 0.8) : .clear)
                         .frame(height: 3)
@@ -230,6 +323,8 @@ struct CustomTabView: View {
                     HistoryView()
                 case .friends:
                     FriendsView()
+                case .settings:
+                    SettingsView()
                 }
             }
         }
@@ -243,6 +338,8 @@ struct CustomTabView: View {
             return state.language == "zh" ? "历史" : "History"
         case .friends:
             return state.language == "zh" ? "好友" : "Friends"
+        case .settings:
+            return state.language == "zh" ? "设置" : "Settings"
         }
     }
 }
